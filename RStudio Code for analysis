@@ -1,0 +1,406 @@
+#Getting the Working Directory
+getwd()
+setwd("path/to/directory")
+
+
+#Calling the Required Libraries
+library(BiocManager)
+library(forcats)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(readr)
+library(tidyr)
+library(survminer)
+library(GEOquery)
+library(limma)
+library(pheatmap)
+library(org.Hs.eg.db)
+install.packages("scales") 
+
+#Importing the Dataset
+library(GEOquery)
+my_id <- "GSE172423" #Change the dataset ID to my_variable id
+gse <- getGEO(my_id)
+
+#Check how many platforms used
+length(gse)
+gse <- gse[[1]]
+gse #Get the information about platform
+
+#Print the sample information
+sample <- pData(gse) 
+
+#Print the gene annotation information
+annotation_data <- fData(gse)
+
+#Print the expression data (intensities)
+expression_data  <- exprs(gse)
+
+#Check the normalisation and scales used
+#exprs get the expression levels as a data frame and get the distribution
+summary(exprs(gse))
+#Boxplot of the above expression data
+boxplot(exprs(gse),outline=FALSE)
+
+#####
+#The expression values are negative in some cases. The values will be log2 transformed and then a particular offset will be added to set the values greater than 0
+###
+#Log2 Transformation
+min(exprs(gse)) #Minimum expression value
+log2transformed <- log2(expression_data+17.41476) #Adding the offset t the log transformed values 
+#Boxplot of Transformed data
+boxplot(log2transformed,outline=FALSE)
+
+#Inspecting the clinical variables
+library(dplyr)
+sampleInfo <- pData(gse) #Storing the pdata in sampleinfo variable and printing the information
+sampleInfo
+
+#Picking specific columns from sampleinfo
+sampleInfo <- select(sampleInfo, title, geo_accession, source_name_ch1, characteristics_ch1.2)
+sampleInfo <- rename(sampleInfo, group=source_name_ch1, patient=characteristics_ch1.2)
+sampleInfo
+sample <- data.frame(sampleInfo$geo_accession,sampleInfo$time.points)
+#Removing 69th row because it contains incomplete information
+sampleInfo <- sampleInfo[-69,] 
+
+#Finding the median intensities
+medians <- rowMedians(log2transformed)
+hist <- hist(medians, 100, col = "cornsilk1", freq = FALSE, 
+             main = "Histogram of the median intensities", 
+             border = "antiquewhite4",
+             xlab = "Median intensities")
+#Principle Component Analysis
+transpose <- (t(log2transformed))
+transpose <- transpose[is.finite(rowSums(transpose)),]
+PCA <- prcomp(transpose)
+PCA
+percentVar <- round(100*PCA$sdev^2/sum(PCA$sdev^2),1)
+sd_ratio <- sqrt(percentVar[2] / percentVar[1])
+
+dataGG <- data.frame(PC1 = PCA$x[,1], PC2 = PCA$x[,2],
+                     Time = sampleInfo$time.points)
+ggplot(dataGG, aes(PC1, PC2)) +
+  geom_point(aes(colour = Time)) +
+  ggtitle("PCA plot") +
+  xlab(paste0("PC1, VarExp: ", percentVar[1], "%")) +
+  ylab(paste0("PC2, VarExp: ", percentVar[2], "%")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  coord_fixed(ratio = sd_ratio) +
+  scale_shape_manual(values = c(4,15)) + 
+  scale_color_manual(values = c("darkorange2", "dodgerblue4", "red", "green"))
+
+#Constructing Heatmap from Samples and Time Points (of the expression data)
+sampleInfo <- pData(gse) %>% 
+  rename("time.points" = "time point:ch1") #Changing the Column name
+sampleInfo["time.points"][sampleInfo["time.points"] == "2wks"] <- "two_wks" #Changing the name of time points
+sampleInfo["time.points"][sampleInfo["time.points"] == "8wks"] <- "eight_wks" 
+annotation_for_heatmap <- data.frame(time_points = sampleInfo$time.points) #Annotation for heatmap based on time points
+row.names(annotation_for_heatmap) <- row.names(sampleInfo)
+
+dists <- as.matrix(dist(transpose, method = "manhattan")) #Calculating distance 
+rownames(dists) <- row.names(sampleInfo)
+hmcol <- rev(colorRampPalette(RColorBrewer::brewer.pal(9, "YlOrRd"))(255))
+colnames(dists) <- NULL
+diag(dists) <- NA
+ann_colors <- list(time.points = c(ctrl= "chartreuse4", lesion= "burlywood3", two_wks = "blue4", eight_wks = "cadetblue2")) #Constructing heatmap in the next steps
+pheatmap(dists, col = (hmcol), 
+         annotation_row = annotation_for_heatmap,
+         annotation_colors = ann_colors,
+         legend = TRUE, 
+         treeheight_row = 0,
+         legend_breaks = c(min(dists, na.rm = TRUE), 
+                           max(dists, na.rm = TRUE)), 
+         legend_labels = (c("small distance", "large distance")),
+         main = "Heatmap")
+
+#Exporting the data
+library(readr)
+full_output <- cbind(fData(gse),log2transformed)
+write_csv(full_output, path="gse_full_output.csv")
+annotation_data <- fData(gse)
+View(features)
+
+#Look at the features data frame and decide the names of the columns you want to keep
+features <- select(features, ID, ORF)
+full_output <- cbind(features,log2transformed)
+write_csv(full_output, path="gse_full_output.csv")
+
+#Differential Expression Analysis
+library(limma)
+###
+#Changing the column names of time points and the names of the values within
+###
+
+sampleInfo <- pData(gse) %>% 
+  rename("time.points" = "time point:ch1") #Changing the Column name
+sampleInfo["time.points"][sampleInfo["time.points"] == "2wks"] <- "two_wks" #Changing the name of time points
+sampleInfo["time.points"][sampleInfo["time.points"] == "8wks"] <- "eight_wks" 
+
+###
+#Constructing design matrix, linear model without intercept and then fitting the model
+###
+
+#Design Matrix and Linear models
+design <- model.matrix(~0+sampleInfo$"time.points") #Designing the linear model
+design
+colnames(design) <- c("pt.control","pt.8wks", "pt.lesion", "pt.2wks") #Renaming the column names
+design 
+fit <- lmFit(log2transformed, design) #Fitting the model
+fit$coefficients[1:100,]
+
+###
+#Constrcuting contrast matrices between control and lesion, Control and 2weeks and Control vs 8Weeks
+### 
+
+#Contrast Matrices 
+#Contrast1 between control and lesion
+contrast1 <- makeContrasts(
+  controlvslesion = pt.lesion-pt.control,
+  levels=design) #Defining the contrast
+fit2 <- contrasts.fit(fit, contrast1) 
+fit2 <- eBayes(fit2) #Applying ebayes
+
+contrast1 <- topTable(fit2, number=Inf)
+
+hist(contrast1$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "Control vs Lesion", xlab = "p-values") #Histogram for p-values of contrast
+
+#Joining the annotation data with contrast
+annootation_data <- fData(gse) #Annotation data
+annootation_data
+str(annootation_data) 
+annootation_data <- select(anno,ID,ORF)
+fit2$genes <- annootation_data
+annotation <- topTable(fit2)
+contrast1 <- topTable(fit2, number=Inf)
+write_csv(contrast1, path="contrast1.csv") #Saving the contrast1 genes 
+#Filtering the genes of contrast1 on basis of p-value and logfc
+p_cutoff <- 0.05 #Defining p-value cutoff 
+fc_cutoff <- 0.5 #Defining fc_cutoff
+library(dplyr)
+contrast1_filtered <- filter(contrast1,  P.Value < 0.05, (contrast1$logFC > 0.5) | (contrast1$logFC < -0.5)) #Taking genes from Contrast 1
+library(readr)
+write_csv(contrast1_filtered, path="contrast1_filtered.csv") #Writing the CSV File
+contrast1_filtered #printing contrast1 genes
+#Volcano Plot
+EnhancedVolcano(contrast1,
+                lab = rownames(contrast1),
+                x = 'logFC',
+                y = 'P.Value',
+                title = 'Contrast 1 (Control vs Lesion)',
+                pCutoff = p_cutoff,
+                FCcutoff = fc_cutoff,
+                pointSize = 4.0,
+                labSize = 4.0)
+
+#Contrast2 between Control and 2Weeks
+contrast2 <- makeContrasts(
+  controlvs2wks = pt.2wks-pt.control,
+  levels=design) #Defining the contrast
+fit3 <- contrasts.fit(fit, contrast2) #Fiting
+fit3 <- eBayes(fit3)
+
+contrast2 <- topTable(fit3, number=Inf)
+
+hist(contrast2$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "Control vs 2Weeks", xlab = "p-values") #Histogram for p-values of contrast
+#Joining the annotation data with contrast
+annootation_data <- fData(gse) #Annotation data
+annootation_data
+str(annootation_data) 
+anno <- select(annootation_data,ID,ORF)
+fit3$genes <- annootation_data
+annotation <- topTable(fit3)
+contrast2 <- topTable(fit3, number=Inf)
+write_csv(contrast2, path="contrast2.csv") #Saving the contrast2 genes 
+#Filtering the genes of contrast1 on basis of p-value and logfc
+p_cutoff <- 0.05 #Defining p-value cutoff 
+fc_cutoff <- 0.5 #Defining fc_cutoff
+library(dplyr)
+contrast2_filtered <- filter(contrast2,  P.Value < 0.05, (contrast2$logFC > 0.5) | (contrast2$logFC < -0.5)) #Taking genes from Contrast 1
+library(readr)
+write_csv(contrast2_filtered, path="contrast2_filtered.csv") #Writing the CSV File
+contrast2_filtered #printing contrast2 genes
+#Volcano Plot
+EnhancedVolcano(contrast2,
+                lab = rownames(contrast2),
+                x = 'logFC',
+                y = 'P.Value',
+                title = 'Contrast 2 (Control vs 2Weeks)',
+                pCutoff = p_cutoff,
+                FCcutoff = fc_cutoff,
+                pointSize = 4.0,
+                labSize = 4.0)
+
+#Contrast3 between Control and 8Weeks 
+contrast3 <- makeContrasts(
+  controlvs8wks = pt.8wks-pt.control,
+  levels=design) #Defining the contrast
+fit4 <- contrasts.fit(fit, contrast3) #Fiting
+fit4 <- eBayes(fit4)
+
+contrast3 <- topTable(fit4, number=Inf)
+
+hist(contrast3$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "Control vs 8Weeks", xlab = "p-values") #Histogram for p-values of contrast
+#Joining the annotation data with contrast
+annootation_data <- fData(gse) #Annotation data
+annootation_data
+str(annootation_data) 
+anno <- select(annootation_data,ID,ORF)
+
+fit4$genes <- annootation_data
+
+annotation <- topTable(fit4)
+contrast3 <- topTable(fit4, number=Inf)
+write_csv(contrast3, path="contrast3.csv") #Saving the contrast2 genes
+#Filtering the genes of contrast1 on basis of p-value and logfc
+p_cutoff <- 0.05 #Defining p-value cutoff 
+fc_cutoff <- 0.5 #Defining fc_cutoff
+library(dplyr)
+contrast3_filtered <- filter(contrast3,  P.Value < 0.05, (contrast3$logFC > 0.5) | (contrast3$logFC < -0.5)) #Taking genes from Contrast 1
+library(readr)
+write_csv(contrast3_filtered, path="contrast3_filtered.csv") #Writing the CSV File
+contrast3_filtered #printing contrast2 genes
+#Volcano Plot
+EnhancedVolcano(contrast3,
+                lab = rownames(contrast3),
+                x = 'logFC',
+                y = 'P.Value',
+                title = 'Contrast 3 (Control vs 8Weeks)',
+                pCutoff = p_cutoff,
+                FCcutoff = fc_cutoff,
+                pointSize = 4.0,
+                labSize = 4.0)
+
+###
+#Venn diagram of common genes among different contrasts through Draw Venn Diagram
+#Getting the list of common genes and saving it in excel 
+#Getting list of common genes 
+#Common genes in all contrasts
+common_genes_all <- read_excel("path/to/file.xlsx")
+df_common_all <- merge(x = common_genes_all, y = contrast1_filtered, by = "ID",
+                       all.x = TRUE) #Merging the excel file with contrast1 data
+df_common_all <- subset(df_common_all, select = -c(ORF, AveExpr, t, P.Value, adj.P.Val, B)) #Removing unwanted columns
+colnames(df_common_all) <- c("ID","logFC_Contrast1") #Renaming the columns
+df_common_all <- merge(x = df_common_all, y = contrast2_filtered, by = "ID",
+                       all.x = TRUE) #Merging contrast2 data
+df_common_all <- subset(df_common_all, select = -c(ORF, SPOT_ID, AveExpr, t, P.Value, adj.P.Val, B)) #Removing unwanted columns
+colnames(df_common_all) <- c("ID","logFC_Contrast1", "logFC_Contrast2") #Renaming the columns
+df_common_all <- merge(x = df_common_all, y = contrast3_filtered, by = "ID",
+                       all.x = TRUE) #Merging contrast3 data
+df_common_all <- subset(df_common_all, select = -c(ORF, SPOT_ID, AveExpr, t, P.Value, adj.P.Val, B)) #Removing unwanted columns
+colnames(df_common_all) <- c("ID","logFC_Contrast1", "logFC_Contrast2", "logFC_Contrast3") #Renaming the columns
+write_csv(df_common_all, path="Common_Genes_All.csv")
+
+###
+#Filtering the upregulated genes based on logfc greater than 0.5
+### 
+
+#Upregulated genes in all contrasts
+#Contrast1
+contrast1_up <- filter(contrast1,  P.Value < 0.05, (contrast1$logFC > 0.5)) #Taking genes from Contrast 1
+library(readr)
+write_csv(contrast1_up, path="contrast1_up.csv") #Writing the CSV File
+contrast1_up 
+#Contrast2
+contrast2_up <- filter(contrast2,  P.Value < 0.05, (contrast2$logFC > 0.5)) #Taking genes from Contrast 1
+library(readr)
+write_csv(contrast2_up, path="contrast2_up.csv") #Writing the CSV File
+contrast2_up
+#Contrast3
+contrast3_up <- filter(contrast3,  P.Value < 0.05, (contrast3$logFC > 0.5)) #Taking genes from Contrast 1
+library(readr)
+write_csv(contrast3_up, path="contrast3_up.csv") #Writing the CSV File
+contrast3_up
+
+#Venn diagram to find the common upregulated genes (DrawVennDiagram)
+
+###
+#Filtering the downregulated genes based on logfc less than -0.5
+###
+
+#Downregulated genes in contrasts
+#Contrast1
+contrast1_down <- filter(contrast1,  P.Value < 0.05, (contrast1$logFC < -0.5)) #Taking genes from Contrast 1
+library(readr)
+write_csv(contrast1_down, path="contrast1_down.csv") #Writing the CSV File
+contrast1_down 
+#Contrast2
+contrast2_down <- filter(contrast2,  P.Value < 0.05, (contrast2$logFC < -0.5)) #Taking genes from Contrast 1
+library(readr)
+write_csv(contrast2_down, path="contrast2_down.csv") #Writing the CSV File
+contrast2_down
+#Contrast3
+contrast3_down <- filter(contrast3,  P.Value < 0.05, (contrast3$logFC < -0.5)) #Taking genes from Contrast 1
+library(readr)
+write_csv(contrast3_down, path="contrast3_down.csv") #Writing the CSV File
+contrast3_down
+
+###
+#Venn diagram construction to find the common upregulated and downregulated genes from all contrasts
+###
+#Common Upregulated genes among all contrasts
+common_genes_up <- read_excel("path/to/file.xlsx")
+df_common_up <- merge(x = common_genes_up, y = contrast1_up, by = "ID",
+                       all.x = TRUE) #Merging the excel file with contrast1 data
+df_common_up <- subset(df_common_up, select = -c(ORF, AveExpr, t, P.Value, adj.P.Val, B)) #Removing unwanted columns
+colnames(df_common_up) <- c("ID","logFC_Contrast1") #Renaming the columns
+df_common_up <- merge(x = df_common_up, y = contrast2_up, by = "ID",
+                       all.x = TRUE) #Merging contrast2 data
+df_common_up <- subset(df_common_up, select = -c(ORF, SPOT_ID, AveExpr, t, P.Value, adj.P.Val, B)) #Removing unwanted columns
+colnames(df_common_up) <- c("ID","logFC_Contrast1", "logFC_Contrast2") #Renaming the columns
+df_common_up <- merge(x = df_common_up, y = contrast3_up, by = "ID",
+                       all.x = TRUE) #Merging contrast3 data
+df_common_up <- subset(df_common_up, select = -c(ORF, SPOT_ID, AveExpr, t, P.Value, adj.P.Val, B)) #Removing unwanted columns
+colnames(df_common_up) <- c("ID","logFC_Contrast1", "logFC_Contrast2", "logFC_Contrast3") #Renaming the columns
+write_csv(df_common_up, path="Common_Genes_UP.csv")
+
+#Common Downregulated genes among all contrasts
+common_genes_down <- read_excel("path/to/file.xlsx")
+df_common_down <- merge(x = common_genes_down, y = contrast1_down, by = "ID",
+                      all.x = TRUE) #Merging the excel file with contrast1 data
+df_common_down <- subset(df_common_down, select = -c(ORF, AveExpr, t, P.Value, adj.P.Val, B)) #Removing unwanted columns
+colnames(df_common_down) <- c("ID","logFC_Contrast1") #Renaming the columns
+df_common_down <- merge(x = df_common_down, y = contrast2_down, by = "ID",
+                      all.x = TRUE) #Merging contrast2 data
+df_common_down <- subset(df_common_down, select = -c(ORF, SPOT_ID, AveExpr, t, P.Value, adj.P.Val, B)) #Removing unwanted columns
+colnames(df_common_down) <- c("ID","logFC_Contrast1", "logFC_Contrast2") #Renaming the columns
+df_common_down <- merge(x = df_common_down, y = contrast3_down, by = "ID",
+                      all.x = TRUE) #Merging contrast3 data
+df_common_down <- subset(df_common_down, select = -c(ORF, SPOT_ID, AveExpr, t, P.Value, adj.P.Val, B)) #Removing unwanted columns
+colnames(df_common_down) <- c("ID","logFC_Contrast1", "logFC_Contrast2", "logFC_Contrast3") #Renaming the columns
+write_csv(df_common_down, path="Common_Genes_DOWN.csv")
+
+
+###
+#Gene Set Enrichment Analysis
+###
+#Calling the required libraries and packages
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+organism = "org.Hs.eg.db"
+# reading in data from deseq2
+df = read.csv("Contrast1_filtered.csv", header=TRUE)
+# we want the log2 fold change 
+original_gene_list <- df$logFC
+# name the vector
+names(original_gene_list) <- df$X
+# omit any NA values 
+gene_list<-na.omit(original_gene_list)
+# sort the list in decreasing order (required for clusterProfiler)
+gene_list = sort(gene_list, decreasing = TRUE)
+keytypes(org.Hs.eg.db)
+gse <- gseGO(geneList=gene_list, 
+             ont ="ALL", 
+             keyType = "PMID", 
+             nPerm = 10000, 
+             minGSSize = 3, 
+             maxGSSize = 500, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism, 
+             pAdjustMethod = "none")
